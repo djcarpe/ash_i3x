@@ -1,0 +1,16 @@
+defmodule AshI3x.Application do
+  @moduledoc false
+
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      {Registry, keys: :unique, name: AshI3x.Subscription.Registry},
+      {Registry, keys: :duplicate, name: AshI3x.Subscription.Listeners},
+      {DynamicSupervisor, strategy: :one_for_one, name: AshI3x.Subscription.Supervisor}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: AshI3x.Supervisor)
+  end
+end
