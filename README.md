@@ -8,6 +8,10 @@ attributes. Each record becomes an **Object**. Ash relationships become i3X
 **relationships**. One plug then serves the whole i3X 1.0 API: browsing,
 current and historical values, writes, and subscriptions over sync or SSE.
 
+Types that are not resources (a device model stored as data, different for
+every tenant) are served by a [source](#sources) instead, alone or beside the
+resources.
+
 ## Installation
 
 ```elixir
@@ -95,6 +99,65 @@ and set the actor with `Ash.PlugHelpers.set_actor/2`. Everything then runs as
 that actor with `authorize?: true`: an Object the actor's policies hide is a
 404, and a subscription only delivers changes its actor may read.
 
+## Sources
+
+A resource is one Object Type, fixed at compile time. When the types are data
+(models in a table, classes in a graph, a tag list read from a PLC) implement
+`AshI3x.Source`: the plug asks it at request time, with the actor and tenant
+of the request, and it answers in i3X terms.
+
+```elixir
+defmodule MyApp.I3x.Devices do
+  @behaviour AshI3x.Source
+
+  @impl true
+  def object_types(ctx, _opts) do
+    for model <- MyApp.Models.list(ctx.tenant) do
+      %{
+        elementId: model.name <> "Type",
+        displayName: model.title,
+        namespaceUri: "https://example.com/ns/devices",
+        sourceTypeId: model.name,
+        schema: MyApp.Models.json_schema(model)
+      }
+    end
+  end
+
+  @impl true
+  def list(%{type: type, root?: root?}, ctx, _opts), do: ...   # [%AshI3x.Object{}]
+
+  @impl true
+  def fetch(element_ids, ctx, _opts), do: ...                  # [%AshI3x.Object{}]
+
+  @impl true
+  def values(objects, ctx, _opts), do: ...
+  # %{"pump-101" => %{value: %{"flow" => 12.5}, quality: "Good", timestamp: ~U[...]}}
+end
+```
+
+```elixir
+forward "/i3x/v1", AshI3x.Plug,
+  domains: [MyApp.Plant],            # optional
+  sources: [MyApp.I3x.Devices]       # or {MyApp.I3x.Devices, opts}
+```
+
+Those three callbacks and `object_types/2` are required. The optional ones add
+namespaces, relationships (`related/4`), writes, history and what `GET /info`
+reports. `list/3` is browsing and should not read values. Authorization is
+the source's: an Object the actor may not see is simply not returned. See
+`AshI3x.Source` for every callback.
+
+A source tells subscriptions about a change itself:
+
+```elixir
+AshI3x.Source.publish(MyApp.I3x.Devices, tenant, "pump-101")
+# or, to skip reading the Object again for each subscriber:
+AshI3x.Source.publish(MyApp.I3x.Devices, tenant, "pump-101", %{value: %{"flow" => 12.7}})
+```
+
+ElementIds and type ids must be unique across the domains and sources of one
+plug, and a relationship stays within its source.
+
 ## History
 
 Ash has no notion of history, so `/objects/history` asks a module of yours:
@@ -122,8 +185,10 @@ through Ash actions reach subscribers. Two things do not, unless you help:
 - Bulk actions notify only with `notify?: true`.
 - Changes made outside Ash need `AshI3x.Subscription.publish/3`.
 
-Subscriptions are processes on the node that created them. They are lost on
-restart, and in a cluster a client must keep reaching the same node.
+Subscriptions are processes on the node that created them, and are lost when
+it restarts. In a cluster of connected nodes nothing else is needed: a change
+published on one node reaches the subscriptions held on the others, and a
+sync, stream, register or delete is answered by whichever node receives it.
 
 ## Limits
 
@@ -136,7 +201,7 @@ restart, and in a cluster a client must keep reaching the same node.
 
 ## Conformance
 
-`test/conformance_server.exs` serves the test resources over HTTP for the
+`test/conformance_server.exs` serves the test resources and a test source over HTTP for the
 [official conformance suite](https://github.com/cesmii/i3X/tree/1.0/conformance-tests):
 
 ```sh

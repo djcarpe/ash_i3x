@@ -4,24 +4,26 @@ defmodule AshI3x.Subscription do
   for it.
 
   Each subscription is a process on the node that created it. It is fed by
-  `AshI3x.Notifier`, holds updates until the client collects them with
-  `/subscriptions/sync` or `/subscriptions/stream`, and stops itself when the
-  client has done neither for the time to live.
+  `AshI3x.Notifier` and `AshI3x.Source.publish/4`, holds updates until the
+  client collects them with `/subscriptions/sync` or `/subscriptions/stream`,
+  and stops itself when the client has done neither for the time to live.
 
-  Subscriptions live in memory on one node: they do not survive a restart,
-  and a client must keep talking to the node that holds its subscription.
+  Subscriptions live in memory and do not survive a restart of their node.
+  In a cluster of connected nodes a change published on one node reaches the
+  subscriptions held on the others, and a request for a subscription is
+  answered by whichever node receives it.
   """
 
   use GenServer, restart: :temporary
 
-  alias AshI3x.Objects
   alias AshI3x.Resource.Info
-  alias AshI3x.Value
+  alias AshI3x.Source.Resources
+  alias AshI3x.Sources
 
   require Logger
 
   @registry __MODULE__.Registry
-  @listeners __MODULE__.Listeners
+  @listeners AshI3x.Subscription.Listeners
 
   @doc false
   def start_link(opts) do
@@ -40,7 +42,23 @@ defmodule AshI3x.Subscription do
 
   @doc false
   # A subscription owned by another client is indistinguishable from none.
+  # One that is not on this node may be on another.
   def lookup(id, client_id) do
+    with nil <- local(id, client_id), [_ | _] = nodes <- Node.list() do
+      nodes
+      |> :erpc.multicall(__MODULE__, :local, [id, client_id], 5_000)
+      |> Enum.find_value(fn
+        {:ok, pid} when is_pid(pid) -> pid
+        _ -> nil
+      end)
+    else
+      pid when is_pid(pid) -> pid
+      [] -> nil
+    end
+  end
+
+  @doc false
+  def local(id, client_id) do
     case Registry.lookup(@registry, id) do
       [{pid, ^client_id}] -> pid
       _ -> nil
@@ -73,18 +91,26 @@ defmodule AshI3x.Subscription do
   """
   @spec publish(Ash.Resource.t(), tenant :: term, Ash.Resource.record()) :: :ok
   def publish(resource, tenant, record) do
-    Registry.dispatch(@listeners, key(resource, tenant, Info.element_id(record)), fn entries ->
-      for {pid, _} <- entries, do: send(pid, {:changed, resource, record})
-    end)
+    element_id = Info.element_id(record)
+
+    notify(
+      {Resources, Resources.tenant(resource, tenant), element_id},
+      element_id,
+      {:record, resource, record}
+    )
   end
 
-  # A tenant only tells Objects apart when their resource is multitenant.
-  defp key(resource, tenant, element_id) do
-    case Ash.Resource.Info.multitenancy_strategy(resource) do
-      nil -> {nil, element_id}
-      _ -> {tenant, element_id}
-    end
+  @doc false
+  # Listeners are a `:pg` group per Object, so members on other nodes hear too.
+  def notify(key, element_id, payload) do
+    for pid <- :pg.get_members(@listeners, key),
+        do: send(pid, {:i3x_changed, element_id, payload})
+
+    :ok
   end
+
+  defp key(%{source: {module, _opts}, tenant: tenant, element_id: element_id}),
+    do: {module, tenant, element_id}
 
   @impl true
   def init(opts) do
@@ -92,7 +118,7 @@ defmodule AshI3x.Subscription do
       id: opts[:id],
       display_name: opts[:display_name],
       ctx: opts[:ctx],
-      # elementId => {resource, maxDepth}
+      # elementId => {source, listener key, maxDepth}
       monitored: %{},
       # Updates not yet handed out, oldest first.
       pending: :queue.new(),
@@ -111,7 +137,7 @@ defmodule AshI3x.Subscription do
   @impl true
   def handle_call(:info, _from, state) do
     monitored =
-      for {element_id, {_resource, max_depth}} <- Enum.sort(state.monitored),
+      for {element_id, {_source, _key, max_depth}} <- Enum.sort(state.monitored),
           do: %{elementId: element_id, maxDepth: max_depth}
 
     {:reply,
@@ -121,11 +147,10 @@ defmodule AshI3x.Subscription do
 
   def handle_call({:register, objects, max_depth}, _from, state) do
     monitored =
-      Enum.reduce(objects, state.monitored, fn {element_id, resource}, monitored ->
-        if not is_map_key(monitored, element_id),
-          do: Registry.register(@listeners, key(resource, state.ctx.tenant, element_id), nil)
+      Enum.reduce(objects, state.monitored, fn %{element_id: element_id} = object, monitored ->
+        if not is_map_key(monitored, element_id), do: :pg.join(@listeners, key(object), self())
 
-        Map.put_new(monitored, element_id, {resource, max_depth})
+        Map.put_new(monitored, element_id, {object.source, key(object), max_depth})
       end)
 
     {:reply, :ok, %{state | monitored: monitored}}
@@ -134,8 +159,7 @@ defmodule AshI3x.Subscription do
   def handle_call({:unregister, element_ids}, _from, state) do
     {found, monitored} = Map.split(state.monitored, element_ids)
 
-    for {element_id, {resource, _max_depth}} <- found,
-        do: Registry.unregister(@listeners, key(resource, state.ctx.tenant, element_id))
+    for {_element_id, {_source, key, _max_depth}} <- found, do: :pg.leave(@listeners, key, self())
 
     {:reply, Map.keys(found), %{state | monitored: monitored}}
   end
@@ -167,8 +191,8 @@ defmodule AshI3x.Subscription do
   def handle_call(:delete, _from, state), do: {:stop, :normal, :ok, close_stream(state)}
 
   @impl true
-  def handle_info({:changed, resource, record}, state) do
-    case update(resource, record, state) do
+  def handle_info({:i3x_changed, element_id, payload}, state) do
+    case update(element_id, payload, state) do
       nil -> {:noreply, state}
       update -> {:noreply, deliver(state, update)}
     end
@@ -182,23 +206,15 @@ defmodule AshI3x.Subscription do
 
   def handle_info(_message, state), do: {:noreply, state}
 
-  # What the subscriber is told about a change. When the resource has
-  # policies or loaded fields the record is read again as the subscriber; a
-  # change they may no longer see is not delivered.
-  defp update(resource, record, state) do
-    exposure = state.ctx.catalog.exposures[resource]
-    element_id = Info.element_id(record)
-
-    current =
-      cond do
-        is_nil(exposure) -> nil
-        exposure.reread? -> [element_id] |> Objects.fetch(state.ctx) |> Map.get(element_id)
-        true -> {exposure, record}
-      end
-
-    case current do
-      {exposure, record} -> exposure |> Value.vqt(record) |> Map.put(:elementId, element_id)
-      nil -> nil
+  # What the subscriber is told about a change. Unless the source vouches for
+  # the published value, the Object is read again as the subscriber; a change
+  # they may no longer see is not delivered.
+  defp update(element_id, payload, state) do
+    with %{^element_id => {source, _key, _max_depth}} <- state.monitored,
+         %{} = vqt <- Sources.changed(source, element_id, payload, state.ctx) do
+      Map.put(vqt, :elementId, element_id)
+    else
+      _ -> nil
     end
   rescue
     error ->

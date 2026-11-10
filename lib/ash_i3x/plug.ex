@@ -1,6 +1,7 @@
 defmodule AshI3x.Plug do
   @moduledoc """
-  Serves the i3X 1.0 API for the resources of some domains.
+  Serves the i3X 1.0 API for the resources of some domains, for
+  `AshI3x.Source` modules, or for both.
 
   The specification puts the API under `/v1`, so mount it there:
 
@@ -12,7 +13,10 @@ defmodule AshI3x.Plug do
 
   ## Options
 
-    * `:domains` - the domains whose `AshI3x.Resource` resources to serve. Required.
+    * `:domains` - the domains whose `AshI3x.Resource` resources to serve.
+    * `:sources` - `AshI3x.Source` modules, each a module or `{module, opts}`,
+      for Object Types that are not resources. At least one of `:domains` and
+      `:sources` is required.
     * `:namespace` - the Namespace URI of resources that do not set their own.
     * `:namespaces` - a map of Namespace URI to displayName. A Namespace
       without an entry is displayed as its URI.
@@ -41,8 +45,7 @@ defmodule AshI3x.Plug do
 
   import Plug.Conn
 
-  alias AshI3x.Catalog
-  alias AshI3x.Objects
+  alias AshI3x.Sources
   alias AshI3x.Subscription
   alias AshI3x.Value
 
@@ -64,6 +67,7 @@ defmodule AshI3x.Plug do
     opts
     |> Keyword.validate!([
       :domains,
+      :sources,
       :namespace,
       :namespaces,
       :server_name,
@@ -75,7 +79,12 @@ defmodule AshI3x.Plug do
       keepalive: 15_000
     ])
     |> Map.new()
-    |> Map.put_new_lazy(:domains, fn -> raise ArgumentError, "AshI3x.Plug needs :domains" end)
+    |> then(fn opts ->
+      case Sources.from_opts(opts) do
+        [] -> raise ArgumentError, "AshI3x.Plug needs :domains or :sources"
+        sources -> Map.put(opts, :sources, sources)
+      end
+    end)
   end
 
   @impl true
@@ -90,7 +99,8 @@ defmodule AshI3x.Plug do
     conn = conn |> Plug.Parsers.call(@parsers) |> fetch_query_params()
 
     ctx = %{
-      catalog: Catalog.get(opts.domains, opts),
+      sources: opts.sources,
+      namespaces: opts[:namespaces],
       actor: Ash.PlugHelpers.get_actor(conn),
       tenant: Ash.PlugHelpers.get_tenant(conn),
       max_depth: opts.max_depth,
@@ -122,52 +132,54 @@ defmodule AshI3x.Plug do
   ## Explore
 
   defp route("GET", ["info"], _params, ctx, opts) do
-    exposures = Map.values(ctx.catalog.exposures)
-
     success(%{
       specVersion: "1.0",
       serverName: opts[:server_name],
       serverVersion: opts[:server_version],
       capabilities: %{
-        query: %{history: Enum.any?(exposures, & &1.history)},
+        query: %{history: Sources.can?(ctx, :history)},
         update: %{
-          current: Enum.any?(exposures, & &1.update_action),
-          history: Enum.any?(exposures, &Objects.history_writable?/1)
+          current: Sources.can?(ctx, :write),
+          history: Sources.can?(ctx, :write_history)
         },
         subscribe: %{stream: opts.stream?}
       }
     })
   end
 
-  defp route("GET", ["namespaces"], _params, ctx, _opts), do: success(ctx.catalog.namespaces)
+  defp route("GET", ["namespaces"], _params, ctx, _opts), do: success(Sources.namespaces(ctx))
 
   defp route("GET", ["objecttypes"], params, ctx, _opts) do
-    ctx.catalog.types
-    |> Map.values()
-    |> in_namespace(params, & &1.namespace)
-    |> Enum.sort_by(& &1.type)
-    |> Enum.map(&object_type/1)
+    ctx
+    |> Sources.object_types()
+    |> in_namespace(params, & &1.namespaceUri)
+    |> Enum.sort_by(& &1.elementId)
     |> success()
   end
 
   defp route("POST", ["objecttypes", "query"], params, ctx, _opts) do
     with {:ok, ids} <- strings(params, "elementIds") do
+      types = ctx |> Sources.object_types() |> Map.new(&{&1.elementId, &1})
+
       bulk(ids, :elementId, fn id ->
-        case ctx.catalog.types[id] do
-          nil -> {:error, 404, "Object type not found: #{id}"}
-          exposure -> {:ok, object_type(exposure)}
+        case types do
+          %{^id => type} -> {:ok, type}
+          _ -> {:error, 404, "Object type not found: #{id}"}
         end
       end)
     end
   end
 
   defp route("GET", ["relationshiptypes"], params, ctx, _opts),
-    do: ctx.catalog.relationship_types |> in_namespace(params, & &1.namespaceUri) |> success()
+    do:
+      ctx |> Sources.relationship_types() |> in_namespace(params, & &1.namespaceUri) |> success()
 
   defp route("POST", ["relationshiptypes", "query"], params, ctx, _opts) do
     with {:ok, ids} <- strings(params, "elementIds") do
+      types = Sources.relationship_types(ctx)
+
       bulk(ids, :elementId, fn id ->
-        case Enum.find(ctx.catalog.relationship_types, &(&1.elementId == id)) do
+        case Enum.find(types, &(&1.elementId == id)) do
           nil -> {:error, 404, "Relationship type not found: #{id}"}
           type -> {:ok, type}
         end
@@ -177,20 +189,20 @@ defmodule AshI3x.Plug do
 
   defp route("GET", ["objects"], params, ctx, _opts) do
     ctx
-    |> Objects.list(params["typeElementId"], params["root"] == "true")
-    |> Objects.describe(ctx, params["includeMetadata"] == "true")
+    |> Sources.list(params["typeElementId"], params["root"] == "true")
+    |> Sources.describe(ctx, params["includeMetadata"] == "true")
     |> Enum.sort_by(& &1.elementId)
     |> success()
   end
 
   defp route("POST", ["objects", "list"], params, ctx, _opts) do
     with {:ok, ids} <- strings(params, "elementIds") do
-      found = Objects.fetch(ids, ctx)
+      found = Sources.fetch(ids, ctx)
       objects = Map.values(found)
 
       described =
         objects
-        |> Objects.describe(ctx, params["includeMetadata"] == true)
+        |> Sources.describe(ctx, params["includeMetadata"] == true)
         |> Map.new(&{&1.elementId, &1})
 
       objects(ids, described, &{:ok, &1})
@@ -200,24 +212,19 @@ defmodule AshI3x.Plug do
   defp route("POST", ["objects", "related"], params, ctx, _opts) do
     with {:ok, ids} <- strings(params, "elementIds"),
          {:ok, type} <- optional_string(params, "relationshipType") do
-      found = Objects.fetch(ids, ctx)
-      edges = Objects.edges(Map.values(found), ctx, if(type, do: [type], else: :all))
+      found = Sources.fetch(ids, ctx)
+      edges = Sources.edges(Map.values(found), ctx, if(type, do: [type], else: :all))
 
       described =
         for({_id, edges} <- edges, {_type, object} <- edges, do: object)
-        |> Enum.uniq_by(fn {_exposure, record} -> AshI3x.Resource.Info.element_id(record) end)
-        |> then(&Enum.zip(&1, Objects.describe(&1, ctx, params["includeMetadata"] == true)))
-        |> Map.new(fn {{_exposure, record}, object} ->
-          {{record.__struct__, object.elementId}, object}
-        end)
+        |> Enum.uniq_by(& &1.element_id)
+        |> Sources.describe(ctx, params["includeMetadata"] == true)
+        |> Map.new(&{&1.elementId, &1})
 
-      objects(ids, found, fn {_exposure, record} ->
-        id = AshI3x.Resource.Info.element_id(record)
-
+      objects(ids, found, fn object ->
         {:ok,
-         for {type, {_exposure, %resource{} = target}} <- Map.get(edges, id, []) do
-           target_id = AshI3x.Resource.Info.element_id(target)
-           %{sourceRelationship: type, object: described[{resource, target_id}]}
+         for {type, target} <- Map.get(edges, object.element_id, []) do
+           %{sourceRelationship: type, object: described[target.element_id]}
          end}
       end)
     end
@@ -229,7 +236,7 @@ defmodule AshI3x.Plug do
     with {:ok, ids} <- strings(params, "elementIds"),
          {:ok, max_depth} <- max_depth(params) do
       {values, partial?} =
-        ids |> Objects.fetch(ctx) |> Map.values() |> Objects.values(max_depth, ctx)
+        ids |> Sources.fetch(ctx) |> Map.values() |> Sources.values(max_depth, ctx)
 
       ids |> objects(values, &{:ok, &1}) |> depth_limited(partial?)
     end
@@ -240,15 +247,16 @@ defmodule AshI3x.Plug do
          {:ok, from} <- time(params, "startTime"),
          {:ok, to} <- time(params, "endTime"),
          {:ok, _max_depth} <- max_depth(params) do
-      found = Objects.fetch(ids, ctx)
-      compositions = found |> Map.values() |> Objects.compositions(ctx)
+      found = Sources.fetch(ids, ctx)
+      compositions = found |> Map.values() |> Sources.compositions(ctx)
 
       objects(ids, found, fn object ->
-        id = AshI3x.Resource.Info.element_id(elem(object, 1))
+        case Sources.history(object, from, to, ctx) do
+          {:ok, values} ->
+            {:ok, %{isComposition: object.element_id in compositions, values: values}}
 
-        case Objects.history(object, from, to, ctx) do
-          {:ok, values} -> {:ok, %{isComposition: id in compositions, values: values}}
-          {:error, error} -> error(error)
+          {:error, error} ->
+            error(error)
         end
       end)
     end
@@ -257,21 +265,21 @@ defmodule AshI3x.Plug do
   ## Update
 
   defp route("PUT", ["objects", "value"], params, ctx, _opts) do
-    with :ok <- supported(ctx, & &1.update_action, "Writing values is not supported."),
+    with :ok <- supported(ctx, :write, "Writing values is not supported."),
          {:ok, updates} <- updates(params, false) do
-      found = Objects.fetch(Enum.map(updates, & &1.id), ctx)
+      found = Sources.fetch(Enum.map(updates, & &1.id), ctx)
 
       bulk(updates, :elementId, & &1.id, fn update ->
         case found[update.id] do
           nil ->
             {:error, 404, "Element not found: #{update.id}"}
 
-          {%{update_action: nil}, _record} ->
+          %{writable?: false} ->
             {:error, 501, "Element cannot be written: #{update.id}"}
 
           object ->
-            case Objects.write(object, update.value, update.quality, update.timestamp, ctx) do
-              {:ok, _record} -> {:ok, nil}
+            case Sources.write(object, update.value, update.quality, update.timestamp, ctx) do
+              :ok -> {:ok, nil}
               {:error, error} -> error(error)
             end
         end
@@ -280,21 +288,20 @@ defmodule AshI3x.Plug do
   end
 
   defp route("PUT", ["objects", "history"], params, ctx, _opts) do
-    with :ok <-
-           supported(ctx, &Objects.history_writable?/1, "Writing history is not supported."),
+    with :ok <- supported(ctx, :write_history, "Writing history is not supported."),
          {:ok, updates} <- updates(params, true) do
-      found = Objects.fetch(Enum.map(updates, & &1.id), ctx)
+      found = Sources.fetch(Enum.map(updates, & &1.id), ctx)
 
       bulk(updates, :elementId, & &1.id, fn update ->
         case found[update.id] do
           nil ->
             {:error, 404, "Element not found: #{update.id}"}
 
-          {exposure, _record} = object ->
+          object ->
             entry = Map.take(update, [:value, :quality, :timestamp])
 
-            with true <- Objects.history_writable?(exposure),
-                 :ok <- Objects.write_history(object, entry, ctx) do
+            with true <- object.history_writable?,
+                 :ok <- Sources.write_history(object, entry, ctx) do
               {:ok, nil}
             else
               false -> {:error, 501, "Element history cannot be written: #{update.id}"}
@@ -331,10 +338,9 @@ defmodule AshI3x.Plug do
     with {:ok, pid} <- subscription(params),
          {:ok, ids} <- strings(params, "elementIds"),
          {:ok, max_depth} <- max_depth(params) do
-      found = Objects.fetch(ids, ctx)
-      monitored = for {id, {exposure, _record}} <- found, do: {id, exposure.resource}
+      found = Sources.fetch(ids, ctx)
 
-      with :ok <- Subscription.register(pid, monitored, max_depth),
+      with :ok <- Subscription.register(pid, Map.values(found), max_depth),
            do: objects(ids, found, fn _object -> {:ok, nil} end)
     end
     |> gone()
@@ -545,8 +551,8 @@ defmodule AshI3x.Plug do
   defp gone({:error, :not_found}), do: {:error, 404, "Subscription not found."}
   defp gone(response), do: response
 
-  defp supported(ctx, fun, message) do
-    if Enum.any?(Map.values(ctx.catalog.exposures), fun), do: :ok, else: {:error, 501, message}
+  defp supported(ctx, what, message) do
+    if Sources.can?(ctx, what), do: :ok, else: {:error, 501, message}
   end
 
   defp in_namespace(items, params, fun) do
@@ -557,18 +563,6 @@ defmodule AshI3x.Plug do
   end
 
   ## Responses
-
-  defp object_type(exposure) do
-    type = %{
-      elementId: exposure.type,
-      displayName: exposure.type_display_name,
-      namespaceUri: exposure.namespace,
-      sourceTypeId: exposure.source_type_id,
-      schema: exposure.schema
-    }
-
-    if exposure.version, do: Map.put(type, :version, exposure.version), else: type
-  end
 
   defp success(result), do: {200, %{success: true, result: result}}
 
@@ -613,6 +607,8 @@ defmodule AshI3x.Plug do
   defp error(%Ash.Error.Forbidden{} = error), do: {:error, 403, Exception.message(error)}
   defp error(%Ash.Error.Invalid{} = error), do: {:error, 400, Exception.message(error)}
   defp error({:invalid, message}), do: {:error, 400, message}
+  defp error({:forbidden, message}), do: {:error, 403, message}
+  defp error({:unsupported, message}), do: {:error, 501, message}
   defp error(error) when is_exception(error), do: {:error, 500, Exception.message(error)}
   defp error(error), do: {:error, 500, inspect(error)}
 
