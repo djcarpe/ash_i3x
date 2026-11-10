@@ -1,17 +1,15 @@
 defmodule AshI3x.Objects do
   @moduledoc false
 
-  # Reads and writes Objects through Ash. Everything runs as the request's
-  # actor and tenant with `authorize?: true`; an Object the actor cannot read
-  # does not exist as far as the API is concerned.
+  # Reads and writes the records behind Objects through Ash, for
+  # `AshI3x.Source.Resources`. Everything runs as the request's actor and
+  # tenant with `authorize?: true`; an Object the actor cannot read does not
+  # exist as far as the API is concerned.
   #
-  # An Object is passed around as an `{exposure, record}` pair.
+  # A record is passed around as an `{exposure, record}` pair.
 
   alias AshI3x.Catalog
   alias AshI3x.Resource.Info
-  alias AshI3x.Value
-
-  require Ash.Query
 
   @to_one ["HasParent", "ComponentOf"]
 
@@ -64,67 +62,6 @@ defmodule AshI3x.Objects do
       |> Ash.read!()
       |> Enum.map(&{exposure, &1})
     end)
-  end
-
-  @doc "Objects as the API describes them, in the order given."
-  def describe(objects, ctx, metadata?) do
-    edges = edges(objects, ctx, if(metadata?, do: :all, else: ["HasComponent" | @to_one]))
-
-    for {exposure, record} <- objects do
-      element_id = Info.element_id(record)
-      edges = Map.get(edges, element_id, [])
-
-      object = %{
-        elementId: element_id,
-        displayName: display_name(exposure, record, element_id),
-        typeElementId: exposure.type,
-        parentId: target(edges, "HasParent") || target(edges, "ComponentOf"),
-        isComposition: Enum.any?(edges, &match?({"HasComponent", _}, &1)),
-        isExtended: false
-      }
-
-      if metadata?,
-        do: Map.put(object, :metadata, metadata(exposure, record, edges)),
-        else: object
-    end
-  end
-
-  defp display_name(%{display_name: nil}, _record, element_id), do: element_id
-
-  defp display_name(%{display_name: attribute}, record, element_id) do
-    case Map.get(record, attribute) do
-      nil -> element_id
-      name -> to_string(name)
-    end
-  end
-
-  defp target(edges, type) do
-    Enum.find_value(edges, fn {edge_type, {_exposure, record}} ->
-      edge_type == type && Info.element_id(record)
-    end)
-  end
-
-  defp metadata(exposure, record, edges) do
-    relationships =
-      edges
-      |> Enum.group_by(&elem(&1, 0), fn {_type, {_exposure, target}} ->
-        Info.element_id(target)
-      end)
-      |> Map.new(fn
-        {type, [id | _]} when type in @to_one -> {type, id}
-        {type, ids} -> {type, ids}
-      end)
-
-    metadata = %{
-      typeNamespaceUri: exposure.namespace,
-      sourceTypeId: exposure.source_type_id,
-      relationships: relationships
-    }
-
-    case exposure.description && Map.get(record, exposure.description) do
-      nil -> metadata
-      description -> Map.put(metadata, :description, to_string(description))
-    end
   end
 
   @doc """
@@ -213,89 +150,11 @@ defmodule AshI3x.Objects do
   defp wanted?(:all, _type), do: true
   defp wanted?(only, type), do: type in only
 
-  @doc """
-  The current value of each Object, as a map of elementId to result, and
-  whether the server's depth limit cut any composition short.
-
-  `max_depth` counts levels from the Object itself: 1 is the Object alone, 0
-  is no limit but the server's.
-  """
-  def values(objects, max_depth, ctx) do
-    {components, partial?} =
-      descend(Enum.map(objects, &{Info.element_id(elem(&1, 1)), &1}), 1, max_depth, ctx, %{})
-
-    results =
-      Map.new(objects, fn {exposure, record} ->
-        element_id = Info.element_id(record)
-        result = exposure |> Value.vqt(record) |> Map.put(:isComposition, false)
-
-        {element_id,
-         case components do
-           %{^element_id => :unfetched} ->
-             %{result | isComposition: true}
-
-           %{^element_id => found} ->
-             found =
-               Map.new(found, fn {exposure, record} ->
-                 {Info.element_id(record), Value.vqt(exposure, record)}
-               end)
-
-             result |> Map.put(:isComposition, true) |> Map.put(:components, found)
-
-           _ ->
-             result
-         end}
-      end)
-
-    {results, partial?}
-  end
-
-  @doc "Which of the Objects are compositions, as a set of elementIds."
-  def compositions(objects, ctx) do
-    objects |> edges(ctx, ["HasComponent"]) |> Map.keys() |> MapSet.new()
-  end
-
-  # Walks HasComponent one level at a time. `frontier` pairs each object on
-  # the current level with the requested Object it descends from.
-  defp descend(frontier, level, max_depth, ctx, found) do
-    children = edges(Enum.map(frontier, &elem(&1, 1)), ctx, ["HasComponent"])
-
-    next =
-      for {root, {_exposure, record}} <- frontier,
-          {_type, child} <- Map.get(children, Info.element_id(record), []),
-          do: {root, child}
-
-    cond do
-      next == [] ->
-        {found, false}
-
-      max_depth != 0 and level >= max_depth ->
-        {mark_unfetched(found, next), false}
-
-      level >= ctx.max_depth ->
-        {mark_unfetched(found, next), true}
-
-      true ->
-        found =
-          Enum.reduce(next, found, fn {root, child}, found ->
-            Map.update(found, root, [child], &[child | &1])
-          end)
-
-        descend(next, level + 1, max_depth, ctx, found)
-    end
-  end
-
-  defp mark_unfetched(found, next) do
-    Enum.reduce(next, found, fn {root, _child}, found -> Map.put_new(found, root, :unfetched) end)
-  end
-
   @doc "The historical values of an Object. Without a history module there are none."
   def history({%{history: nil}, _record}, _from, _to, _ctx), do: {:ok, []}
 
   def history({%{history: {module, opts}}, record}, from, to, ctx) do
-    with {:ok, entries} <- module.read(record, from, to, history_opts(opts, ctx)) do
-      {:ok, Enum.map(entries, &Value.vqt(&1.value, &1[:quality], &1.timestamp))}
-    end
+    module.read(record, from, to, history_opts(opts, ctx))
   end
 
   @doc "Whether the Object's resource can have history written."

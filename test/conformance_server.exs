@@ -1,11 +1,12 @@
-# Serves the test plant over HTTP so the official i3X conformance suite
+# Serves the test plant (resources) and the test devices (an AshI3x.Source)
+# over HTTP so the official i3X conformance suite
 # (https://github.com/cesmii/i3X/tree/1.0/conformance-tests) can be run
 # against this library:
 #
 #     MIX_ENV=test mix run test/conformance_server.exs
 #     node bin/i3x-test.js run http://localhost:4040/v1
 
-alias AshI3x.Test.{History, Line, Measurement, Pump, Tank}
+alias AshI3x.Test.{Devices, History, Line, Measurement, Pump, Tank}
 
 defmodule AshI3x.Test.Server do
   use Plug.Router
@@ -17,6 +18,7 @@ defmodule AshI3x.Test.Server do
     to: AshI3x.Plug,
     init_opts: [
       domains: [AshI3x.Test.Plant],
+      sources: [Devices],
       namespace: "https://example.com/ns/plant",
       namespaces: %{"https://example.com/ns/plant" => "Plant"},
       server_name: "ash_i3x conformance",
@@ -29,6 +31,9 @@ defmodule AshI3x.Test.Server do
 end
 
 {:ok, _} = History.start()
+
+# Requests carry no tenant, so the devices are the ones of tenant nil.
+{:ok, _} = Devices.start(%{nil => Devices.sample()["acme"]})
 
 line = Ash.create!(Line, %{name: "Line A"})
 tank = Ash.create!(Tank, %{tag: "tank-201", level: 4.5, line_id: line.id})
@@ -52,6 +57,7 @@ spawn(fn ->
   |> Enum.each(fn tick ->
     Ash.update!(temp, %{reading: 70.0 + rem(tick, 10) / 10})
     Ash.update!(pump, %{flow_rate: 12.0 + rem(tick, 5) / 10})
+    Devices.set(nil, "filler-1", %{"speed" => 40.0 + rem(tick, 7)})
   end)
 end)
 

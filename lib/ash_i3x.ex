@@ -6,6 +6,9 @@ defmodule AshI3x do
   A resource that uses `AshI3x.Resource` becomes an i3X Object Type, its
   records become Objects, and `AshI3x.Plug` serves them: browsing, current
   and historical values, writes and subscriptions.
+
+  Object Types that are not resources come from an `AshI3x.Source`, which
+  the same plug serves.
   """
 
   @doc "The i3X elementId of a record of a resource that uses `AshI3x.Resource`."
